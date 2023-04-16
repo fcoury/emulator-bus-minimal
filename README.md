@@ -4,6 +4,9 @@
 
 I am writing an emulator and am having a hard time modeling a solution for this problem. Below is what I have so far. I am sure there's a better way to model this problem, and that's exactly what I am looking for.
 
+I have published the example code here: https://github.com/fcoury/emulator-bus-minimal
+And there's a [Rust playground link](https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=6c1e5f19cf62bfe6aece4f27ef0beeb9) as well.
+
 I am trying to model the following scenario:
 
 ## Structs
@@ -19,6 +22,10 @@ I am trying to model the following scenario:
 - Machine asks CPU to step to next instruction via the BUS
 - CPU reads a given memory address and writes to a given VDP port via the BUS
 - VDP receives the write and enables interrupts on CPU via the BUS
+
+Here's a sequence diagram illustrating the complete flow:
+
+![Sequence Diagram](imgs/sequence.png)
 
 ### Problem
 
