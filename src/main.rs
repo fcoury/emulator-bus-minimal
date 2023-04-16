@@ -1,22 +1,11 @@
-use std::{
-    sync::{
-        mpsc::{channel, Receiver, Sender},
-        Arc, Mutex,
-    },
-    thread,
-};
+use std::{cell::RefCell, rc::Rc};
 
-#[derive(Debug)]
 enum Message {
     CpuStep,
     ReadByte(u16),
+    ReadByteResponse(u8),
     VdpEnableLineInterrupt,
     CpuEnableInterrupt,
-}
-
-#[derive(Debug)]
-enum Response {
-    ByteRead(u8),
 }
 
 struct Machine {
@@ -25,27 +14,15 @@ struct Machine {
 
 impl Machine {
     fn new() -> Self {
-        let (request_sender, request_receiver) = channel();
-        let (response_sender, response_receiver) = channel();
-        let response_receiver = Arc::new(Mutex::new(response_receiver));
-
-        let cpu = Cpu::new(request_sender.clone(), response_receiver.clone());
-        let vdp = Vdp::new(request_sender.clone());
+        let queue = Rc::new(RefCell::new(Vec::new()));
+        let cpu = Cpu::new(queue.clone());
+        let vdp = Vdp::new(queue.clone());
         let ppi = Ppi {};
-        let bus = Bus::new(
-            cpu,
-            vdp,
-            ppi,
-            request_sender,
-            response_receiver,
-            request_receiver,
-            response_sender,
-        );
+        let bus = Bus::new(cpu, vdp, ppi, queue);
         Self { bus }
     }
 
     fn step(&mut self) {
-        println!("Machine step");
         self.bus.step();
     }
 }
@@ -54,56 +31,47 @@ struct Bus {
     cpu: Cpu,
     vdp: Vdp,
     ppi: Ppi,
-    request_sender: Sender<Message>,
-    response_receiver: Arc<Mutex<Receiver<Response>>>,
-    request_receiver: Receiver<Message>,
-    response_sender: Sender<Response>,
+    queue: Rc<RefCell<Vec<Message>>>,
 }
 
 impl Bus {
-    fn new(
-        cpu: Cpu,
-        vdp: Vdp,
-        ppi: Ppi,
-        request_sender: Sender<Message>,
-        response_receiver: Arc<Mutex<Receiver<Response>>>,
-        request_receiver: Receiver<Message>,
-        response_sender: Sender<Response>,
-    ) -> Self {
+    fn new(cpu: Cpu, vdp: Vdp, ppi: Ppi, queue: Rc<RefCell<Vec<Message>>>) -> Self {
         Self {
             cpu,
             vdp,
             ppi,
-            request_sender,
-            response_receiver,
-            request_receiver,
-            response_sender,
+            queue,
         }
     }
 
     fn step(&mut self) {
         println!("Bus step");
-        self.request_sender.send(Message::CpuStep).unwrap();
+        self.queue.borrow_mut().push(Message::CpuStep);
 
         loop {
-            if let Ok(message) = self.request_receiver.recv() {
-                println!("Bus recv: {:?}", message);
-                match message {
-                    Message::CpuStep => {
-                        self.cpu.step();
-                    }
-                    Message::ReadByte(addr) => {
-                        println!("Bus read_byte {:x}", addr);
-                        let data = self.ppi.read_byte(addr);
-                        self.response_sender.send(Response::ByteRead(data)).unwrap();
-                    }
-                    Message::VdpEnableLineInterrupt => {
-                        self.vdp.enable_line_interrupt();
-                    }
-                    Message::CpuEnableInterrupt => {
-                        self.cpu.enable_interrupt();
-                    }
-                };
+            let Some(message) = self.queue.borrow_mut().pop() else {
+                break;
+            };
+
+            match message {
+                Message::CpuStep => {
+                    self.cpu.step();
+                }
+                Message::ReadByte(addr) => {
+                    let data = self.ppi.read_byte(addr);
+                    self.queue
+                        .borrow_mut()
+                        .push(Message::ReadByteResponse(data));
+                }
+                Message::ReadByteResponse(data) => {
+                    // How do I get the data to the External CPU?
+                }
+                Message::VdpEnableLineInterrupt => {
+                    self.vdp.enable_line_interrupt();
+                }
+                Message::CpuEnableInterrupt => {
+                    self.cpu.enable_interrupt();
+                }
             }
         }
     }
@@ -114,11 +82,8 @@ struct Cpu {
 }
 
 impl Cpu {
-    fn new(
-        request_sender: Sender<Message>,
-        response_receiver: Arc<Mutex<Receiver<Response>>>,
-    ) -> Self {
-        let io = Io::new(request_sender, response_receiver);
+    fn new(queue: Rc<RefCell<Vec<Message>>>) -> Self {
+        let io = Io::new(queue);
         let ext_cpu = ExtCpu { io };
         Self { ext_cpu }
     }
@@ -144,19 +109,17 @@ impl Ppi {
 }
 
 struct Vdp {
-    request_sender: Sender<Message>,
+    queue: Rc<RefCell<Vec<Message>>>,
 }
 
 impl Vdp {
-    fn new(request_sender: Sender<Message>) -> Self {
-        Self { request_sender }
+    fn new(queue: Rc<RefCell<Vec<Message>>>) -> Self {
+        Self { queue }
     }
 
     fn enable_line_interrupt(&self) {
         println!("Vdp enable_line_interrupt");
-        self.request_sender
-            .send(Message::CpuEnableInterrupt)
-            .unwrap();
+        self.queue.borrow_mut().push(Message::CpuEnableInterrupt);
     }
 }
 
@@ -186,34 +149,20 @@ impl<T: ExtCpuIo> ExtCpu<T> {
 }
 
 struct Io {
-    request_sender: Sender<Message>,
-    response_receiver: Arc<Mutex<Receiver<Response>>>,
+    queue: Rc<RefCell<Vec<Message>>>,
 }
 
 impl Io {
-    fn new(
-        request_sender: Sender<Message>,
-        response_receiver: Arc<Mutex<Receiver<Response>>>,
-    ) -> Self {
-        Self {
-            request_sender,
-            response_receiver,
-        }
+    fn new(queue: Rc<RefCell<Vec<Message>>>) -> Self {
+        Self { queue }
     }
 }
 
 impl ExtCpuIo for Io {
     fn read(&self, addr: u16) -> u8 {
-        let sender = self.request_sender.clone();
         println!("ExtCpuIo read: {:x}", addr);
-        sender.send(Message::ReadByte(addr)).unwrap();
-
-        let response_receiver = self.response_receiver.lock().unwrap();
-        let response = response_receiver.recv().unwrap();
-        println!("ExtCpuIo read response: {:?}", response);
-        match response {
-            Response::ByteRead(data) => data,
-        }
+        self.queue.borrow_mut().push(Message::ReadByte(0x0042));
+        todo!("How do I get the u8 to respond the External CPU?")
     }
 
     fn write(&self, addr: u16, data: u8) {
@@ -227,9 +176,11 @@ impl ExtCpuIo for Io {
 
     fn write_port(&self, port: u8, data: u8) {
         println!("ExtCpuIo write_port: {:x} {:x}", port, data);
-        self.request_sender
-            .send(Message::VdpEnableLineInterrupt)
-            .unwrap();
+        if port == 0x00 {
+            self.queue
+                .borrow_mut()
+                .push(Message::VdpEnableLineInterrupt);
+        }
     }
 }
 
